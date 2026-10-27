@@ -1,0 +1,116 @@
+name: Build LiveSimBooter
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        type: choice
+        options: [Debug, Release]
+        default: Release
+      build_guest_tools:
+        description: Also build the guest shim and helper dylibs/executables
+        type: boolean
+        default: true
+
+env:
+  CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+
+jobs:
+  build:
+    # Apple Silicon runner with the iOS 26 SDK (the app targets iOS 26.0+).
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      # Unsigned build: CI has no team, certificate or provisioning profiles.
+      # Signing (with the App Group + increased-memory-limit entitlements) is
+      # done afterwards on your machine, see the notes in the job summary.
+      - name: Build native host + LiveProcess extension
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LiveSimBooter.xcodeproj \
+            -scheme LiveSimBooter \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log
+
+      - name: Locate built app
+        id: app
+        run: |
+          APP="build/Build/Products/${CONFIGURATION}-iphoneos/LiveSimBooter.app"
+          test -d "$APP"
+          echo "path=$APP" >> "$GITHUB_OUTPUT"
+          ls -R "$APP/PlugIns" | head -50
+
+      - name: Package unsigned IPA
+        run: |
+          rm -rf Payload && mkdir Payload
+          ditto "${{ steps.app.outputs.path }}" Payload/LiveSimBooter.app
+          mkdir -p dist
+          zip -qry dist/LiveSimBooter-unsigned.ipa Payload
+          ls -lh dist
+
+      # Guest-side pieces from Tools/. These are compiled with the
+      # iphonesimulator SDK and do not need the Apple runtime.
+      - name: Build guest shim and helpers
+        if: ${{ inputs.build_guest_tools != false }}
+        continue-on-error: true
+        run: |
+          set -e
+          mkdir -p dist/guest
+          sh Tools/build-spawn-shim.sh dist/guest/libLiveSimSpawn.dylib dist/guest/spawn-probe
+          sh Tools/build-terminal-fish.sh dist/guest
+          sh Tools/build-display-settings.sh dist/guest
+          sh Tools/build-launchctl-control.sh dist/guest
+          sh Tools/build-app-registration.sh dist/guest
+          ls -lh dist/guest
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveSimBooter-unsigned-ipa
+          path: dist/LiveSimBooter-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload guest tools
+        if: ${{ hashFiles('dist/guest/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveSimBooter-guest-tools
+          path: dist/guest
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Summary
+        run: |
+          {
+            echo "### LiveSimBooter build"
+            echo
+            echo "Built **$CONFIGURATION** unsigned. Before installing on a device you still need to:"
+            echo "- sign the app and \`PlugIns/LiveProcess.appex\` with your own profiles (same App Group and \`com.apple.developer.kernel.increased-memory-limit\` on both)"
+            echo "- add the NativeMetal dylibs (\`Tools/prepare-native-metal.py\`, needs the 23A343 simulator runtime)"
+            echo "- stage the runtime/cache as described in \`docs/agent-setup.md\`"
+          } >> "$GITHUB_STEP_SUMMARY"

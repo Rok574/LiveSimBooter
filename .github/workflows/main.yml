@@ -1,117 +1,324 @@
-name: Build LiveSimBooter
+name: Build signed app + RuntimeRoot
+
+# Automates docs/agent-setup.md on a GitHub-hosted Mac. Run manually.
+#
+# Required repository secrets:
+#   TEAM_ID                  Apple developer team ID
+#   SIGNING_CERT_P12_BASE64  base64 of your development certificate (.p12)
+#   SIGNING_CERT_PASSWORD    password of that .p12
+#   APP_PROFILE_BASE64       base64 of the app's .mobileprovision (bundle_id)
+#   EXT_PROFILE_BASE64       base64 of the extension's .mobileprovision (bundle_id.LiveProcess)
+# Both profiles must include your App Group (group.<bundle_id>) and
+# com.apple.developer.kernel.increased-memory-limit, and your device UDID.
+#
+#   ARTIFACT_PASSPHRASE      any long random string; uploaded artifacts are AES-encrypted with it
+#
+# Safe for a public repo: artifacts there are downloadable by any GitHub user, so
+# the IPA (embeds your profile/UDIDs) and RuntimeRoot (Apple files) are encrypted
+# before upload. Job logs in a public repo are public too, so nothing sensitive is printed.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
-      configuration:
-        description: Xcode build configuration
-        type: choice
-        options: [Debug, Release]
-        default: Release
-      build_guest_tools:
-        description: Also build the guest shim and helper dylibs/executables
-        type: boolean
-        default: true
+      bundle_id:
+        description: App bundle ID registered to your team (extension = <id>.LiveProcess, group = group.<id>)
+        required: true
+        type: string
 
 env:
-  CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+  LSB_WORK: ${{ github.workspace }}/tmp/setup-26.0
+  LSB_BUNDLE_ID: ${{ inputs.bundle_id }}
+  LSB_EXTENSION_ID: ${{ inputs.bundle_id }}.LiveProcess
+  LSB_APP_GROUP: group.${{ inputs.bundle_id }}
+  LSB_TEAM: ${{ secrets.TEAM_ID }}
+  SIM_BUILD: 23A343
 
 jobs:
-  build:
-    # The project file uses Xcode 27's format (objectVersion 110), which Xcode 26.x
-    # cannot open, so use the Xcode 27 runner image (arm64 only).
-    runs-on: xcode-27
+  setup:
+    runs-on: xcode-27-xlarge   # arm64, extra disk/CPU; use xcode-27 if xlarge is unavailable
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Show toolchain
+      - name: Make room and show toolchain
         run: |
+          mkdir -p "$LSB_WORK"
+          # The runtime + cache + staged tree need many GB; drop unused Xcode 26 installs.
+          CUR=$(xcode-select -p | sed 's#/Contents/Developer##')
+          for x in /Applications/Xcode_26*.app /Applications/Xcode_27_beta*.app; do
+            [ -d "$x" ] && [ "$x" != "$CUR" ] && sudo rm -rf "$x" || true
+          done
+          df -h /
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           xcrun --sdk iphonesimulator --show-sdk-path
+          which zstd || brew install zstd
 
-      # Unsigned build: CI has no team, certificate or provisioning profiles.
-      # Signing (with the App Group + increased-memory-limit entitlements) is
-      # done afterwards on your machine, see the notes in the job summary.
-      - name: Build native host + LiveProcess extension
+      # Rewrite the identifiers the project ships with to yours (guide: "Configure these source settings").
+      - name: Apply team identifiers to sources
         run: |
-          set -o pipefail
-          xcodebuild \
-            -project LiveSimBooter.xcodeproj \
-            -scheme LiveSimBooter \
-            -configuration "$CONFIGURATION" \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build | tee build.log
+          python3 - <<'PY'
+          import os, re, glob, pathlib
+          app, ext, group = os.environ['LSB_BUNDLE_ID'], os.environ['LSB_EXTENSION_ID'], os.environ['LSB_APP_GROUP']
+          pbx = pathlib.Path('LiveSimBooter.xcodeproj/project.pbxproj')
+          text = pbx.read_text()
+          ids = sorted(set(re.findall(r'PRODUCT_BUNDLE_IDENTIFIER = "?([A-Za-z0-9.\-]+)"?;', text)), key=len)
+          print('bundle ids in project:', ids)
+          old_app = ids[0]
+          old_ext = next(i for i in ids if i != old_app and i.startswith(old_app))
+          targets = [pbx, pathlib.Path('ProcessSupport/SpawnPlan.h')] + [pathlib.Path(p) for p in glob.glob('**/*.entitlements', recursive=True) if not p.startswith(('tmp/', 'unused/'))]
+          old_group = None
+          for p in targets:
+              m = re.search(r'group\.[A-Za-z0-9.\-]+', p.read_text())
+              if m and p.name != 'project.pbxproj':
+                  old_group = m.group(0); break
+          print('old app/ext/group:', old_app, old_ext, old_group)
+          for p in targets:
+              t = p.read_text()
+              t = t.replace(old_ext, ext).replace(old_app, app)
+              if old_group: t = t.replace(old_group, group)
+              p.write_text(t)
+          PY
+          git diff --stat
 
-      - name: Locate built app
-        id: app
+      - name: Install signing certificate and profiles
+        env:
+          P12: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          P12_PW: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          APP_PROF: ${{ secrets.APP_PROFILE_BASE64 }}
+          EXT_PROF: ${{ secrets.EXT_PROFILE_BASE64 }}
         run: |
-          APP="build/Build/Products/${CONFIGURATION}-iphoneos/LiveSimBooter.app"
-          test -d "$APP"
-          echo "path=$APP" >> "$GITHUB_OUTPUT"
-          ls -R "$APP/PlugIns" | head -50
+          KC="$RUNNER_TEMP/lsb.keychain-db"; KCPW=$(uuidgen)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PW" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          ID=$(security find-identity -v -p codesigning "$KC" | awk '/[0-9A-F]{40}/{print $2; exit}')
+          test -n "$ID"
+          echo "LSB_SIGNING_IDENTITY=$ID" >> "$GITHUB_ENV"
+          echo "$APP_PROF" | base64 --decode > "$LSB_WORK/app.mobileprovision"
+          echo "$EXT_PROF" | base64 --decode > "$LSB_WORK/ext.mobileprovision"
+          for n in app ext; do
+            security cms -D -i "$LSB_WORK/$n.mobileprovision" > "$LSB_WORK/$n-profile.plist"
+            /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$LSB_WORK/$n-profile.plist" > "$LSB_WORK/$n.entitlements"
+          done
+          # Keep identifiers out of public logs.
+          echo "::add-mask::$LSB_TEAM"
+          echo "::add-mask::$LSB_BUNDLE_ID"
 
-      - name: Package unsigned IPA
+      # Apple's runtime is not in the repo. Xcode downloads it; it must be exactly build 23A343.
+      - name: Download iOS 26.0 simulator runtime
         run: |
-          rm -rf Payload && mkdir Payload
-          ditto "${{ steps.app.outputs.path }}" Payload/LiveSimBooter.app
-          mkdir -p dist
-          zip -qry dist/LiveSimBooter-unsigned.ipa Payload
-          ls -lh dist
+          xcodebuild -downloadPlatform iOS -buildVersion 26.0
+          xcrun simctl runtime list || true
+          RR=$(find /Library/Developer/CoreSimulator -maxdepth 9 -type d -path '*iOS 26.0.simruntime/Contents/Resources/RuntimeRoot' 2>/dev/null | head -1)
+          if [ -z "$RR" ]; then RR=$(find /Library/Developer/CoreSimulator -maxdepth 9 -type d -name RuntimeRoot 2>/dev/null | head -1); fi
+          test -d "$RR" || { echo "RuntimeRoot not found"; exit 1; }
+          GOT=$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$RR/System/Library/CoreServices/SystemVersion.plist")
+          echo "Runtime build: $GOT (need $SIM_BUILD)"
+          [ "$GOT" = "$SIM_BUILD" ] || { echo "::error::Runtime is $GOT, project is pinned to $SIM_BUILD"; exit 1; }
+          test -f "$RR/../update_dyld_sim_shared_cache"
+          echo "LSB_RUNTIME_SOURCE=$RR" >> "$GITHUB_ENV"
+          echo "LSB_CAPABILITIES=/Library/Developer/CoreSimulator/Profiles/DeviceTypes/iPhone 15 Pro Max.simdevicetype/Contents/Resources/capabilities.plist" >> "$GITHUB_ENV"
+          df -h /
 
-      # Guest-side pieces from Tools/. These are compiled with the
-      # iphonesimulator SDK and do not need the Apple runtime.
-      - name: Build guest shim and helpers
-        if: ${{ inputs.build_guest_tools != false }}
-        continue-on-error: true
+      - name: Build, patch and sign the shared cache
         run: |
           set -e
-          mkdir -p dist/guest
-          sh Tools/build-spawn-shim.sh dist/guest/libLiveSimSpawn.dylib dist/guest/spawn-probe
-          sh Tools/build-terminal-fish.sh dist/guest
-          sh Tools/build-display-settings.sh dist/guest
-          sh Tools/build-launchctl-control.sh dist/guest
-          sh Tools/build-app-registration.sh dist/guest
-          ls -lh dist/guest
+          python3 Tools/setup-ios26-cache.py --runtime-root "$LSB_RUNTIME_SOURCE" --validate-only > "$LSB_WORK/cache-preflight.json"
+          python3 Tools/setup-ios26-cache.py --runtime-root "$LSB_RUNTIME_SOURCE" --output-dir "$LSB_WORK/cache" > "$LSB_WORK/cache-result.json"
+          mkdir -p "$LSB_WORK/patched-cache" "$LSB_WORK/signed-cache"
+          python3 Tools/patch-ios26-container-metadata.py \
+            --source "$LSB_WORK/cache/unsigned/dyld_sim_shared_cache_arm64" \
+            --output "$LSB_WORK/patched-cache/dyld_sim_shared_cache_arm64" > "$LSB_WORK/cache-metadata-patch.json"
+          python3 Tools/patch-ios26-keyboard-haptics.py \
+            --source "$LSB_WORK/patched-cache/dyld_sim_shared_cache_arm64" \
+            --output "$LSB_WORK/patched-cache/dyld_sim_shared_cache_arm64.haptics" > "$LSB_WORK/cache-haptics-patch.json"
+          python3 Tools/sign-dyld-cache.py "$LSB_WORK/patched-cache/dyld_sim_shared_cache_arm64.haptics" \
+            "$LSB_WORK/signed-cache/dyld_sim_shared_cache_arm64" \
+            --identity "$LSB_SIGNING_IDENTITY" --identifier "$LSB_BUNDLE_ID" --team "$LSB_TEAM" > "$LSB_WORK/cache-signing.json"
+          python3 Tools/setup-ios26-cache.py --check-cache "$LSB_WORK/signed-cache/dyld_sim_shared_cache_arm64" > "$LSB_WORK/cache-signed-layout.json"
+          rm -rf "$LSB_WORK/cache" "$LSB_WORK/patched-cache"   # free space
 
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
+      - name: Prepare loader and guest tools
+        run: |
+          set -e
+          python3 Tools/patch-ios26-cache-base.py \
+            --builder "$LSB_RUNTIME_SOURCE/../update_dyld_sim_shared_cache" \
+            --dyld-sim "$LSB_RUNTIME_SOURCE/usr/lib/dyld_sim" --output-dir "$LSB_WORK/loader-base"
+          python3 Tools/patch-ios26-platform.py --source "$LSB_WORK/loader-base/dyld_sim" --output "$LSB_WORK/dyld_sim"
+          python3 Tools/patch-ios26-launchd-identity.py --source "$LSB_RUNTIME_SOURCE/sbin/launchd_sim" --output "$LSB_WORK/launchd_sim"
+          mkdir -p "$LSB_WORK/guest"
+          sh Tools/build-spawn-shim.sh "$LSB_WORK/guest/libLiveSimSpawn.dylib" "$LSB_WORK/guest/spawn-probe"
+          sh Tools/build-terminal-fish.sh "$LSB_WORK/guest"
+          sh Tools/build-display-settings.sh "$LSB_WORK/guest"
+          sh Tools/build-launchctl-control.sh "$LSB_WORK/guest"
+          sh Tools/build-app-registration.sh "$LSB_WORK/guest"
+          MI_DIR=/System/Library/PrivateFrameworks/MobileInstallation.framework/XPCServices/com.apple.MobileInstallationHelperService.xpc
+          MI="$MI_DIR/com.apple.MobileInstallationHelperService"
+          echo "LSB_MI_HELPER=$MI" >> "$GITHUB_ENV"
+          python3 Tools/patch-ios26-container-metadata.py --mach-o \
+            --source "$LSB_RUNTIME_SOURCE$MI" --output "$LSB_WORK/MobileInstallationHelperService" > "$LSB_WORK/helper-metadata-patch.json"
+
+      - name: Build Fish 4.9.3 for the simulator
+        run: |
+          set -e
+          cd "$LSB_WORK"
+          curl -fsSL -o fish.tar.xz https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz
+          echo "20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c  fish.tar.xz" | shasum -a 256 -c -
+          mkdir fish-source && tar -xf fish.tar.xz -C fish-source --strip-components=1
+          rustup toolchain install 1.91.1 --profile minimal --target aarch64-apple-ios-sim
+          cat > simulator-clang.sh <<'SH'
+          #!/bin/sh
+          exec /usr/bin/xcrun --sdk iphonesimulator clang -target arm64-apple-ios26.0-simulator "$@"
+          SH
+          chmod +x simulator-clang.sh
+          CARGO_TARGET_DIR="$LSB_WORK/fish-target" \
+          CARGO_TARGET_AARCH64_APPLE_IOS_SIM_LINKER="$LSB_WORK/simulator-clang.sh" \
+          CC_aarch64_apple_ios_sim="$LSB_WORK/simulator-clang.sh" \
+          CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_DEBUG=1 \
+          IPHONEOS_DEPLOYMENT_TARGET=26.0 PCRE2_SYS_STATIC=1 PREFIX=/usr \
+          cargo +1.91.1 build --locked --release --no-default-features --target aarch64-apple-ios-sim \
+            --manifest-path "$LSB_WORK/fish-source/Cargo.toml" --bin fish
+          echo "LSB_FISH=$LSB_WORK/fish-target/aarch64-apple-ios-sim/release/fish" >> "$GITHUB_ENV"
+
+      - name: Stage RuntimeRoot
+        run: |
+          set -e
+          CS=/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/Resources/Platforms/iphoneos
+          FB="$CS/Library/PrivateFrameworks/SimFramebuffer.framework"
+          HID="$CS/Library/Frameworks/SimulatorHID.framework"
+          test -d "$FB" && test -d "$HID"
+          python3 Tools/setup-ios26-runtime.py --runtime-root "$LSB_RUNTIME_SOURCE" \
+            --cache-manifest Tools/setup-ios26-cache-inputs.json --stage --output-dir "$LSB_WORK/runtime" \
+            --scope Applications --scope System/Applications --scope System/Library --scope System/Cryptexes \
+            --scope Library --scope usr --scope bin --scope sbin --scope private/etc --scope etc \
+            --scope Developer --scope RestoreVersion.plist --allow-missing-dependencies \
+            --identity "$LSB_SIGNING_IDENTITY" --identifier "$LSB_BUNDLE_ID" --capabilities "$LSB_CAPABILITIES" \
+            --add-binary "/usr/lib/dyld_sim=$LSB_WORK/dyld_sim" \
+            --add-binary "/sbin/launchd_sim=$LSB_WORK/launchd_sim" \
+            --add-binary "/usr/lib/libLiveSimSpawn.dylib=$LSB_WORK/guest/libLiveSimSpawn.dylib" \
+            --add-binary "/bin/spawn-probe=$LSB_WORK/guest/spawn-probe" \
+            --add-binary "/usr/libexec/terminal-fish=$LSB_WORK/guest/terminal-fish" \
+            --add-binary "/usr/libexec/display-settings=$LSB_WORK/guest/display-settings" \
+            --add-binary "/usr/libexec/launchctl-control=$LSB_WORK/guest/launchctl-control" \
+            --add-binary "/usr/libexec/app-registration=$LSB_WORK/guest/app-registration" \
+            --add-binary "$LSB_MI_HELPER=$LSB_WORK/MobileInstallationHelperService" \
+            --add-binary "/bin/fish=$LSB_FISH" \
+            --add-binary "/Library/PrivateFrameworks/SimFramebuffer.framework/SimFramebuffer=$FB/SimFramebuffer" \
+            --add-binary "/Library/Frameworks/SimulatorHID.framework/SimulatorHID=$HID/SimulatorHID" \
+            > "$LSB_WORK/runtime-stage.json" 2> "$LSB_WORK/runtime-stage.log"
+          RR="$LSB_WORK/runtime/RuntimeRoot"
+          cp "$FB/Info.plist"  "$RR/Library/PrivateFrameworks/SimFramebuffer.framework/Info.plist"
+          cp "$HID/Info.plist" "$RR/Library/Frameworks/SimulatorHID.framework/Info.plist"
+          mkdir -p "$RR/System/Library/Caches/com.apple.dyld"
+          cp "$LSB_WORK/signed-cache/dyld_sim_shared_cache_arm64" "$RR/System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64"
+          python3 Tools/setup-ios26-device-types.py --device-types-root /Library/Developer/CoreSimulator/Profiles/DeviceTypes \
+            --output-dir "$LSB_WORK/device-types"
+          ditto "$LSB_WORK/device-types/RuntimeRoot/Library/Developer/CoreSimulator/DeviceTypes" \
+            "$RR/Library/Developer/CoreSimulator/DeviceTypes"
+          # Optional guest-control / app-registration launchd jobs
+          python3 - "$RR" <<'PY'
+          import pathlib, plistlib, sys
+          root = pathlib.Path(sys.argv[1])
+          jobs = [
+              ('System/Library/LaunchDaemons/com.kdt.LiveSimBooter.launchctl-control.plist',
+               'com.kdt.LiveSimBooter.launchctl-control', ['/usr/libexec/launchctl-control']),
+              ('usr/share/LiveSimBooter/app-registration.plist', 'com.kdt.LiveSimBooter.app-registration',
+               ['/usr/libexec/app-registration', '--manifest', '/usr/share/LiveSimBooter/applications.json']),
+          ]
+          for relative, label, arguments in jobs:
+              path = root / relative
+              path.parent.mkdir(parents=True, exist_ok=True)
+              job = dict(Label=label, ProgramArguments=arguments, WorkingDirectory='/private/var/mobile/',
+                         RunAtLoad=True, KeepAlive=False,
+                         StandardOutPath='/private/var/mobile/Library/Logs/' + label + '.log',
+                         StandardErrorPath='/private/var/mobile/Library/Logs/' + label + '.log')
+              with path.open('xb') as out:
+                  plistlib.dump(job, out)
+          PY
+          du -sh "$RR"; df -h /
+
+      - name: Build and sign the native app
+        run: |
+          set -e
+          xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath "$LSB_WORK/native-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          python3 Tools/prepare-native-metal.py --runtime-root "$LSB_RUNTIME_SOURCE" \
+            --output-dir "$LSB_WORK/native-metal" --self-test > "$LSB_WORK/native-metal.json"
+          APP="$LSB_WORK/package/LiveSimBooter.app"
+          mkdir -p "$LSB_WORK/package"
+          ditto "$LSB_WORK/native-build/Build/Products/Release-iphoneos/LiveSimBooter.app" "$APP"
+          APPEX="$APP/PlugIns/LiveProcess.appex"
+          test -d "$APPEX"
+          NM="$APPEX/Frameworks/NativeMetal"; mkdir -p "$NM"
+          for lib in MetalSerializer MTLSimImplementation MetalNativeProbe; do
+            cp "$LSB_WORK/native-metal/$lib.dylib" "$NM/$lib.dylib"
+            codesign --force --sign "$LSB_SIGNING_IDENTITY" --identifier "$LSB_BUNDLE_ID" --timestamp=none "$NM/$lib.dylib"
+          done
+          cp "$LSB_WORK/ext.mobileprovision" "$APPEX/embedded.mobileprovision"
+          cp "$LSB_WORK/app.mobileprovision" "$APP/embedded.mobileprovision"
+          # Entitlements come from each profile so signature and profile agree.
+          codesign --force --sign "$LSB_SIGNING_IDENTITY" --identifier "$LSB_EXTENSION_ID" \
+            --entitlements "$LSB_WORK/ext.entitlements" --timestamp=none "$APPEX"
+          codesign --force --sign "$LSB_SIGNING_IDENTITY" --identifier "$LSB_BUNDLE_ID" \
+            --entitlements "$LSB_WORK/app.entitlements" --timestamp=none "$APP"
+          codesign --verify --strict --deep "$APP" >/dev/null
+          mkdir -p dist/Payload
+          ditto "$APP" dist/Payload/LiveSimBooter.app
+          (cd dist && zip -qry LiveSimBooter.ipa Payload && rm -rf Payload)
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:ARTIFACT_PASSPHRASE \
+            -in dist/LiveSimBooter.ipa -out dist/LiveSimBooter.ipa.enc
+          rm dist/LiveSimBooter.ipa
+        env:
+          ARTIFACT_PASSPHRASE: ${{ secrets.ARTIFACT_PASSPHRASE }}
+
+      - name: Archive RuntimeRoot (encrypted, split to fit artifact limits)
+        env:
+          ARTIFACT_PASSPHRASE: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          set -e
+          mkdir -p dist/runtime-parts
+          tar -C "$LSB_WORK/runtime" -cf - RuntimeRoot | zstd -T0 -3 \
+            | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:ARTIFACT_PASSPHRASE \
+            | split -b 1800m -d -a 3 - dist/runtime-parts/RuntimeRoot.tar.zst.enc.
+          ls -lh dist/runtime-parts | head -30
+          {
+            echo "### Done (artifacts are encrypted with your ARTIFACT_PASSPHRASE)"
+            echo "1. Download **signed-ipa**, then:"
+            echo '   `openssl enc -d -aes-256-cbc -pbkdf2 -in LiveSimBooter.ipa.enc -out LiveSimBooter.ipa`'
+            echo '   unzip it and run `xcrun devicectl device install app --device <UDID> Payload/LiveSimBooter.app`'
+            echo "2. Download all **runtime-parts** files into one folder, then:"
+            echo '   `cat RuntimeRoot.tar.zst.enc.* | openssl enc -d -aes-256-cbc -pbkdf2 | zstd -d | tar -x`'
+            echo "3. \`xcrun devicectl device copy to --device <UDID> --source RuntimeRoot --destination Documents/RuntimeRoot --domain-type appDataContainer --domain-identifier <your bundle id> --timeout 3600\`"
+            echo "(openssl prompts for the passphrase; or add \`-pass env:ARTIFACT_PASSPHRASE\`.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: LiveSimBooter-unsigned-ipa
-          path: dist/LiveSimBooter-unsigned.ipa
-          if-no-files-found: error
+          name: signed-ipa
+          path: dist/LiveSimBooter.ipa.enc
+          retention-days: 3
 
-      - name: Upload guest tools
-        if: ${{ hashFiles('dist/guest/**') != '' }}
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: LiveSimBooter-guest-tools
-          path: dist/guest
+          name: runtime-parts
+          path: dist/runtime-parts/
+          retention-days: 1
+          compression-level: 0
 
-      - name: Upload build log
+      - name: Upload manifests and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: build.log
+          name: setup-logs
+          path: |
+            tmp/setup-26.0/cache-preflight.json
+            tmp/setup-26.0/cache-signed-layout.json
+            tmp/setup-26.0/runtime-stage.log
           if-no-files-found: ignore
-
-      - name: Summary
-        run: |
-          {
-            echo "### LiveSimBooter build"
-            echo
-            echo "Built **$CONFIGURATION** unsigned. Before installing on a device you still need to:"
-            echo "- sign the app and \`PlugIns/LiveProcess.appex\` with your own profiles (same App Group and \`com.apple.developer.kernel.increased-memory-limit\` on both)"
-            echo "- add the NativeMetal dylibs (\`Tools/prepare-native-metal.py\`, needs the 23A343 simulator runtime)"
-            echo "- stage the runtime/cache as described in \`docs/agent-setup.md\`"
-          } >> "$GITHUB_STEP_SUMMARY"

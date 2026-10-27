@@ -21,8 +21,9 @@ env:
 
 jobs:
   build:
-    # Apple Silicon runner with the iOS 26 SDK (the app targets iOS 26.0+).
-    runs-on: macos-26
+    # The project file uses Xcode 27's format (objectVersion 110), which Xcode 26.x
+    # cannot open, so use the Xcode 27 runner image (arm64 only).
+    runs-on: xcode-27
 
     steps:
       - name: Checkout

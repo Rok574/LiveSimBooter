@@ -1,13 +1,14 @@
 # Put this file at .github/workflows/build-runtime.yml in YOUR fork of LiveSimBooter.
-# It runs the Mac-only setup steps from docs/agent-setup.md on a GitHub macOS runner:
-#   download iOS 26.0 sim runtime (23A343) -> build/patch/sign dyld cache -> patch loader/launchd
-#   -> build guest tools + Fish -> stage RuntimeRoot -> split into <2 GB parts -> publish as a Release.
+# Runs the Mac-only setup steps from docs/agent-setup.md on a GitHub macOS runner:
+#   find/download iOS 26.0 sim runtime (23A343) -> build/patch/sign dyld cache -> patch loader/launchd
+#   -> build guest tools + Fish -> stage RuntimeRoot -> split into <2 GB parts -> publish as a draft Release.
 #
 # Required repo secrets:
-#   SIGNING_P12_BASE64    base64 of the .p12 development certificate that signed your IPA
+#   SIGNING_P12_BASE64    base64 of the .p12 certificate that signed your IPA
 #   SIGNING_P12_PASSWORD  password of that .p12
-# Required inputs (must match the identifiers your IPA was signed with):
-#   team_id, bundle_id
+# Run inputs (must match your installed IPA):
+#   team_id   e.g. 9WGVT3PY3P
+#   bundle_id e.g. com.kdt.LiveSimBooter.9WGVT3PY3P
 #
 # NOTE: the full RuntimeRoot is ~15 GB. Parts are published as GitHub Release assets (2 GB limit each).
 
@@ -20,7 +21,7 @@ on:
         description: "Apple Team ID used to sign your IPA"
         required: true
       bundle_id:
-        description: "App bundle ID of your IPA (e.g. com.you.LiveSimBooter)"
+        description: "App bundle ID of your installed IPA"
         required: true
 
 env:
@@ -36,35 +37,47 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26          # Apple Silicon + Xcode 26. If unavailable, use macos-15 and select Xcode 26.
+    runs-on: macos-26          # Apple Silicon + Xcode 26. If unavailable, try macos-15.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space and show tools
+      - name: Show environment
         run: |
           df -h /
-          sudo rm -rf /Applications/Xcode_1[0-9]*.app 2>/dev/null || true
-          ls /Applications | grep -i xcode || true
+          ls -d /Applications/Xcode*.app || true
           xcodebuild -version
           python3 --version
           mkdir -p "$LSB_WORK"
 
-      - name: Download iOS 26.0 simulator runtime
+      - name: Find or download iOS 26.0 simulator runtime (23A343)
         run: |
-          xcodebuild -downloadPlatform iOS -buildVersion 26.0
-          xcrun simctl runtime list
-          RT="$(find /Library/Developer/CoreSimulator/Volumes -maxdepth 6 -name 'iOS 26.0.simruntime' -print -quit)"
+          echo "== Installed Xcodes =="; ls -d /Applications/Xcode*.app
+          echo "== Existing runtimes =="; xcrun simctl runtime list || true
+          find_rt() {
+            find /Library/Developer/CoreSimulator -maxdepth 8 -name '*.simruntime' 2>/dev/null | while IFS= read -r rt; do
+              b="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$rt/Contents/Resources/RuntimeRoot/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null || true)"
+              echo "found $rt -> $b" >&2
+              if [ "$b" = "$EXPECTED_RUNTIME_BUILD" ]; then echo "$rt"; break; fi
+            done
+          }
+          RT="$(find_rt)"
           if [ -z "$RT" ]; then
-            RT="$(find /Library/Developer/CoreSimulator -maxdepth 8 -name '*.simruntime' -print -quit)"
+            for X in /Applications/Xcode*.app; do
+              echo "== Trying $X =="
+              sudo xcode-select -s "$X"
+              xcodebuild -version
+              if xcodebuild -downloadPlatform iOS -buildVersion 26.0; then
+                RT="$(find_rt)"
+                [ -n "$RT" ] && break
+              fi
+            done
           fi
-          echo "Runtime bundle: $RT"
-          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$RT/Contents/Resources/RuntimeRoot/System/Library/CoreServices/SystemVersion.plist")"
-          echo "Runtime build: $BUILD"
-          if [ "$BUILD" != "$EXPECTED_RUNTIME_BUILD" ]; then
-            echo "::error::Runtime build is $BUILD, but this project is pinned to $EXPECTED_RUNTIME_BUILD. Stopping."
+          if [ -z "$RT" ]; then
+            echo "::error::Could not obtain runtime build $EXPECTED_RUNTIME_BUILD. See the lists above."
             exit 1
           fi
+          echo "Using $RT"
           echo "LSB_RUNTIME_SOURCE=$RT/Contents/Resources/RuntimeRoot" >> "$GITHUB_ENV"
 
       - name: Import signing certificate
@@ -130,11 +143,7 @@ jobs:
           mkdir fish-source && tar -xf fish.tar.xz -C fish-source --strip-components=1
           rustup toolchain install 1.91.1 --profile minimal
           rustup target add aarch64-apple-ios-sim --toolchain 1.91.1
-          cat > simulator-clang.sh <<'SH'
-          #!/bin/sh
-          exec /usr/bin/xcrun --sdk iphonesimulator clang -target arm64-apple-ios26.0-simulator "$@"
-          SH
-          sed -i '' 's/^          //' simulator-clang.sh
+          printf '#!/bin/sh\nexec /usr/bin/xcrun --sdk iphonesimulator clang -target arm64-apple-ios26.0-simulator "$@"\n' > simulator-clang.sh
           chmod +x simulator-clang.sh
           CARGO_TARGET_DIR="$LSB_WORK/fish-target" \
           CARGO_TARGET_AARCH64_APPLE_IOS_SIM_LINKER="$LSB_WORK/simulator-clang.sh" \
@@ -144,6 +153,29 @@ jobs:
           cargo +1.91.1 build --locked --release --no-default-features --target aarch64-apple-ios-sim \
             --manifest-path "$LSB_WORK/fish-source/Cargo.toml" --bin fish
           echo "LSB_FISH=$LSB_WORK/fish-target/aarch64-apple-ios-sim/release/fish" >> "$GITHUB_ENV"
+
+      - name: Write guest job plists helper
+        run: |
+          cat > "$LSB_WORK/make-jobs.py" <<'PY'
+          import pathlib, plistlib, sys
+          root = pathlib.Path(sys.argv[1])
+          jobs = [
+              ('System/Library/LaunchDaemons/com.kdt.LiveSimBooter.launchctl-control.plist',
+               'com.kdt.LiveSimBooter.launchctl-control', ['/usr/libexec/launchctl-control']),
+              ('usr/share/LiveSimBooter/app-registration.plist', 'com.kdt.LiveSimBooter.app-registration',
+               ['/usr/libexec/app-registration', '--manifest', '/usr/share/LiveSimBooter/applications.json']),
+          ]
+          for relative, label, arguments in jobs:
+              path = root / relative
+              path.parent.mkdir(parents=True, exist_ok=True)
+              job = dict(Label=label, ProgramArguments=arguments, WorkingDirectory='/private/var/mobile/',
+                         RunAtLoad=True, KeepAlive=False,
+                         StandardOutPath='/private/var/mobile/Library/Logs/' + label + '.log',
+                         StandardErrorPath='/private/var/mobile/Library/Logs/' + label + '.log')
+              with path.open('xb') as output:
+                  plistlib.dump(job, output)
+          PY
+          sed -i '' 's/^          //' "$LSB_WORK/make-jobs.py"
 
       - name: Stage and sign the full RuntimeRoot
         run: |
@@ -179,26 +211,7 @@ jobs:
             --output-dir "$LSB_WORK/device-types"
           ditto "$LSB_WORK/device-types/RuntimeRoot/Library/Developer/CoreSimulator/DeviceTypes" \
             "$RR/Library/Developer/CoreSimulator/DeviceTypes"
-          # Optional launchctl-control / app-registration job plists (same as the setup guide)
-          python3 - "$RR" <<'PY'
-          import pathlib, plistlib, sys
-          root = pathlib.Path(sys.argv[1])
-          jobs = [
-              ('System/Library/LaunchDaemons/com.kdt.LiveSimBooter.launchctl-control.plist',
-               'com.kdt.LiveSimBooter.launchctl-control', ['/usr/libexec/launchctl-control']),
-              ('usr/share/LiveSimBooter/app-registration.plist', 'com.kdt.LiveSimBooter.app-registration',
-               ['/usr/libexec/app-registration', '--manifest', '/usr/share/LiveSimBooter/applications.json']),
-          ]
-          for relative, label, arguments in jobs:
-              path = root / relative
-              path.parent.mkdir(parents=True, exist_ok=True)
-              job = dict(Label=label, ProgramArguments=arguments, WorkingDirectory='/private/var/mobile/',
-                         RunAtLoad=True, KeepAlive=False,
-                         StandardOutPath='/private/var/mobile/Library/Logs/' + label + '.log',
-                         StandardErrorPath='/private/var/mobile/Library/Logs/' + label + '.log')
-              with path.open('xb') as output:
-                  plistlib.dump(job, output)
-          PY
+          python3 "$LSB_WORK/make-jobs.py" "$RR"
           df -h /
 
       - name: Package RuntimeRoot into 1.9 GB parts
@@ -206,13 +219,13 @@ jobs:
           set -e
           mkdir -p "$LSB_WORK/out"
           cd "$LSB_WORK/runtime"
-          tar -cf - RuntimeRoot | split -b 1900m -d -a 3 - "$LSB_WORK/out/RuntimeRoot.tar.part"
+          tar -cf - RuntimeRoot | split -b 1900m -a 3 - "$LSB_WORK/out/RuntimeRoot.tar.part"
           cp "$LSB_WORK"/*.json "$LSB_WORK/out/" 2>/dev/null || true
           cp "$LSB_WORK/runtime/stage-manifest.json" "$LSB_WORK/out/" 2>/dev/null || true
           cd "$LSB_WORK/out" && shasum -a 256 * > SHA256SUMS.txt
           ls -lh
 
-      - name: Publish as a GitHub Release
+      - name: Publish as a draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

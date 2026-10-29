@@ -109,14 +109,82 @@ jobs:
           RT="$(find_rt)"
           if [ -z "$RT" ] && [ -n "$RUNTIME_URLS" ]; then
             echo "== Downloading runtime from provided URL(s) =="
-            : > "$RUNNER_TEMP/runtime.dmg"
+            DL="$RUNNER_TEMP/rtdl"; mkdir -p "$DL"
+            : > "$DL/runtime.bin"
             for u in $RUNTIME_URLS; do
-              curl -fL --retry 3 "$u" >> "$RUNNER_TEMP/runtime.dmg"
+              curl -fL --retry 3 "$u" >> "$DL/runtime.bin"
             done
-            ls -lh "$RUNNER_TEMP/runtime.dmg"
-            sudo xcrun simctl runtime add "$RUNNER_TEMP/runtime.dmg"
-            xcrun simctl runtime list || true
-            RT="$(find_rt)"
+            ls -lh "$DL/runtime.bin"
+            file "$DL/runtime.bin" || true
+            DMG=""
+            case "$RUNTIME_URLS" in
+              *.aar*|*.aar)
+                # Apple Archive (MobileAsset): unpack, then look for the disk image inside
+                mv "$DL/runtime.bin" "$DL/runtime.aar"
+                mkdir -p "$DL/x"
+                aa extract -i "$DL/runtime.aar" -d "$DL/x" || yaa extract -i "$DL/runtime.aar" -d "$DL/x"
+                find "$DL/x" -maxdepth 6 | head -50
+                DMG="$(find "$DL/x" -name '*.dmg' -print -quit)"
+                ;;
+              *)
+                mv "$DL/runtime.bin" "$DL/runtime.dmg"; DMG="$DL/runtime.dmg"
+                ;;
+            esac
+            if [ -n "$DMG" ]; then
+              echo "Installing disk image: $DMG"
+              sudo xcrun simctl runtime add "$DMG"
+              xcrun simctl runtime list || true
+              RT="$(find_rt)"
+            fi
+            if [ -z "$RT" ]; then
+              # Some archives contain a ready-made .simruntime or RuntimeRoot tree
+              RT="$(find "$DL/x" -name '*.simruntime' -print -quit 2>/dev/null || true)"
+              if [ -n "$RT" ]; then
+                b="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$RT/Contents/Resources/RuntimeRoot/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null || true)"
+                echo "extracted runtime build: $b"
+                [ "$b" = "$EXPECTED_RUNTIME_BUILD" ] || RT=""
+              fi
+            fi
+          fi
+          if [ -z "$RT" ]; then
+            echo "== Looking up 23A343 in Apple's Xcode download index =="
+            cat > "$RUNNER_TEMP/find_runtime.py" <<'PY'
+          import gzip, plistlib, sys, urllib.request
+          INDEXES = [
+              "https://devimages-cdn.apple.com/downloads/xcode/simulators/index2.dvtdownloadableindex",
+              "https://devimages-cdn.apple.com/downloads/xcode/simulators/index-26-.dvtdownloadableindex",
+          ]
+          want = sys.argv[1]
+          for url in INDEXES:
+              try:
+                  raw = urllib.request.urlopen(url, timeout=60).read()
+              except Exception as e:
+                  print("index failed", url, e, file=sys.stderr); continue
+              for data in (raw, None):
+                  try:
+                      data = data or gzip.decompress(raw)
+                      idx = plistlib.loads(data); break
+                  except Exception:
+                      idx = None
+              if not idx:
+                  print("could not parse", url, file=sys.stderr); continue
+              for d in idx.get("downloadables", []):
+                  sv = d.get("simulatorVersion", {}) or {}
+                  if want in str(sv.get("buildUpdate", "")) or want in str(d.get("name", "")) or want in str(d.get("source", "")):
+                      print(d.get("source")); sys.exit(0)
+              print("no", want, "entry in", url, file=sys.stderr)
+          sys.exit(1)
+          PY
+            if SRC="$(python3 "$RUNNER_TEMP/find_runtime.py" "$EXPECTED_RUNTIME_BUILD")" && [ -n "$SRC" ]; then
+              echo "Index source: $SRC"
+              DL="$RUNNER_TEMP/rtidx"; mkdir -p "$DL"
+              if curl -fL --retry 3 -o "$DL/runtime.dmg" "$SRC"; then
+                sudo xcrun simctl runtime add "$DL/runtime.dmg" || true
+                RT="$(find_rt)"
+              else
+                echo "Index download failed (Apple may require a signed-in session for this URL)."
+              fi
+            fi
           fi
           if [ -z "$RT" ]; then
             for X in /Applications/Xcode*.app; do

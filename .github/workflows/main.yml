@@ -1,33 +1,34 @@
-# Put this file at .github/workflows/build-runtime.yml in YOUR fork of LiveSimBooter.
-# Runs the Mac-only setup steps from docs/agent-setup.md on a GitHub macOS runner:
-#   find/download iOS 26.0 sim runtime (23A343) -> build/patch/sign dyld cache -> patch loader/launchd
-#   -> build guest tools + Fish -> stage RuntimeRoot -> split into <2 GB parts -> publish as a draft Release.
+# Save as .github/workflows/build-runtime.yml in YOUR fork of LiveSimBooter.
 #
-# Required repo secrets:
-#   SIGNING_P12_BASE64    base64 of the .p12 certificate that signed your IPA
-#   SIGNING_P12_PASSWORD  password of that .p12
-# Run inputs (must match your installed IPA):
-#   team_id   e.g. 9WGVT3PY3P
-#   bundle_id e.g. com.kdt.LiveSimBooter.9WGVT3PY3P
+# Two jobs:
+#   1. ipa      - builds an UNSIGNED LiveSimBooter.ipa (with file sharing turned on so the app shows in Files).
+#                 Sideload/re-sign it yourself. No secrets needed.
+#   2. runtime  - (optional) builds the signed RuntimeRoot from the iOS 26.0 simulator runtime (build 23A343).
+#                 GitHub's runners do NOT carry 23A343, so you must give it download URL(s) for Apple's runtime .dmg.
 #
-# NOTE: the full RuntimeRoot is ~15 GB. Parts are published as GitHub Release assets (2 GB limit each).
+# Secrets for the runtime job: SIGNING_P12_BASE64, SIGNING_P12_PASSWORD.
 
-name: Build LiveSimBooter runtime
+name: Build LiveSimBooter
 
 on:
   workflow_dispatch:
     inputs:
+      build_runtime:
+        description: "Also build the signed runtime (needs runtime_urls + secrets)"
+        type: boolean
+        default: false
       team_id:
-        description: "Apple Team ID used to sign your IPA"
-        required: true
+        description: "Apple Team ID (runtime job)"
+        default: "9WGVT3PY3P"
       bundle_id:
-        description: "App bundle ID of your installed IPA"
-        required: true
+        description: "Resigned bundle ID (runtime job)"
+        default: "com.kdt.LiveSimBooter.9WGVT3PY3P"
+      runtime_urls:
+        description: "Space-separated direct URL(s) of the iOS 26.0 (23A343) simulator runtime .dmg, in order if split"
+        default: ""
 
 env:
   LSB_WORK: ${{ github.workspace }}/tmp/setup-26.0
-  LSB_TEAM: ${{ inputs.team_id }}
-  LSB_BUNDLE_ID: ${{ inputs.bundle_id }}
   EXPECTED_RUNTIME_BUILD: "23A343"
   FISH_VERSION: "4.9.3"
   FISH_SHA256: "20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c"
@@ -36,24 +37,68 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: macos-26          # Apple Silicon + Xcode 26. If unavailable, try macos-15.
+  # ------------------------------------------------------------------ IPA
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build unsigned app
+        run: |
+          set -e
+          xcodebuild -version
+          xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          APP="build/Build/Products/Release-iphoneos/LiveSimBooter.app"
+          test -d "$APP" || { echo "::error::App not found"; find build -name '*.app' -maxdepth 5; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Turn on file sharing (shows app in Files app)
+        run: |
+          set -e
+          PL="$APP/Info.plist"
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$PL" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$key bool true" "$PL"
+          done
+          plutil -p "$PL" | head -40
+
+      - name: Package IPA
+        run: |
+          set -e
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../LiveSimBooter-unsigned.ipa Payload)
+          ls -lh LiveSimBooter-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveSimBooter-unsigned-ipa
+          path: LiveSimBooter-unsigned.ipa
+
+  # -------------------------------------------------------------- RUNTIME
+  runtime:
+    if: ${{ inputs.build_runtime }}
+    runs-on: macos-26
     timeout-minutes: 360
+    env:
+      LSB_TEAM: ${{ inputs.team_id }}
+      LSB_BUNDLE_ID: ${{ inputs.bundle_id }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Show environment
         run: |
           df -h /
-          ls -d /Applications/Xcode*.app || true
           xcodebuild -version
-          python3 --version
           mkdir -p "$LSB_WORK"
 
-      - name: Find or download iOS 26.0 simulator runtime (23A343)
+      - name: Obtain iOS 26.0 simulator runtime (23A343)
+        env:
+          RUNTIME_URLS: ${{ inputs.runtime_urls }}
         run: |
-          echo "== Installed Xcodes =="; ls -d /Applications/Xcode*.app
-          echo "== Existing runtimes =="; xcrun simctl runtime list || true
           find_rt() {
             find /Library/Developer/CoreSimulator -maxdepth 8 -name '*.simruntime' 2>/dev/null | while IFS= read -r rt; do
               b="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$rt/Contents/Resources/RuntimeRoot/System/Library/CoreServices/SystemVersion.plist" 2>/dev/null || true)"
@@ -62,19 +107,26 @@ jobs:
             done
           }
           RT="$(find_rt)"
+          if [ -z "$RT" ] && [ -n "$RUNTIME_URLS" ]; then
+            echo "== Downloading runtime from provided URL(s) =="
+            : > "$RUNNER_TEMP/runtime.dmg"
+            for u in $RUNTIME_URLS; do
+              curl -fL --retry 3 "$u" >> "$RUNNER_TEMP/runtime.dmg"
+            done
+            ls -lh "$RUNNER_TEMP/runtime.dmg"
+            sudo xcrun simctl runtime add "$RUNNER_TEMP/runtime.dmg"
+            xcrun simctl runtime list || true
+            RT="$(find_rt)"
+          fi
           if [ -z "$RT" ]; then
             for X in /Applications/Xcode*.app; do
-              echo "== Trying $X =="
               sudo xcode-select -s "$X"
-              xcodebuild -version
-              if xcodebuild -downloadPlatform iOS -buildVersion 26.0; then
-                RT="$(find_rt)"
-                [ -n "$RT" ] && break
-              fi
+              xcodebuild -downloadPlatform iOS -buildVersion 26.0 || xcodebuild -downloadPlatform iOS -buildVersion 26.0.1 || true
+              RT="$(find_rt)"; [ -n "$RT" ] && break
             done
           fi
           if [ -z "$RT" ]; then
-            echo "::error::Could not obtain runtime build $EXPECTED_RUNTIME_BUILD. See the lists above."
+            echo "::error::Build $EXPECTED_RUNTIME_BUILD not available on this runner. Provide runtime_urls (direct link(s) to Apple's iOS 26.0 simulator runtime .dmg)."
             exit 1
           fi
           echo "Using $RT"
@@ -115,7 +167,7 @@ jobs:
             --identity "$LSB_SIGNING_IDENTITY" --identifier "$LSB_BUNDLE_ID" --team "$LSB_TEAM" > "$LSB_WORK/cache-signing.json"
           python3 Tools/setup-ios26-cache.py --check-cache "$LSB_WORK/signed-cache/dyld_sim_shared_cache_arm64" > "$LSB_WORK/cache-signed-layout.json"
 
-      - name: Patch loader, launchd and MobileInstallation helper; build guest tools
+      - name: Patch loader, launchd and helper; build guest tools
         run: |
           set -e
           python3 Tools/patch-ios26-cache-base.py \
